@@ -240,10 +240,12 @@ Anthropic supports up to four cache breakpoints per request. ALMS uses two:
 
 Workspace files (personality / goals / memories / user) and episodic summaries are already
 assembled into the system string by the budget-aware runtime context builder and
-`ContextBuilder::build_with_perspective` before the adapter sees them. Splitting them into
-separate content blocks for independent breakpoints would require a runtime refactor; the
-single trailing-system marker gives the full prefix a cache entry today, and the fixed
-per-run workspace budget avoids churn while the files are unchanged.
+`ContextBuilder::build_with_perspective` before the adapter sees them. Personality, goals
+and user files stay whole unless the run budget requires head windows; memories keeps its
+4000-byte tail window. Truncation emits a run warning, and rebuilds reuse the initial
+workspace budget, so unchanged files do not cause per-turn cache churn. Splitting these
+values into separate content blocks for independent breakpoints would require a runtime
+refactor; the single trailing-system marker gives the full prefix a cache entry today.
 
 ### Scope
 

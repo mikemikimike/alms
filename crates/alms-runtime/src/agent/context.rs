@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::context::{
-    ContextBuilder, HISTORY_RESERVE, estimate_session_message_tokens, estimate_tokens,
-    is_stripped_display_marker,
+    ContextBuilder, ESTIMATED_BYTES_PER_TOKEN, HISTORY_RESERVE, estimate_session_message_tokens,
+    estimate_tokens, is_stripped_display_marker,
 };
 use crate::events::PHASE_SUMMARIZING;
 use crate::llm_types::*;
@@ -54,8 +54,11 @@ impl AgentRuntime {
         workspace_budget_bytes: usize,
     ) -> String {
         if let Some(ref ws) = self.workspace {
-            let prefix =
-                ws.build_system_prompt_prefix_with_budget(include_user, workspace_budget_bytes);
+            let (prefix, truncations) = ws.build_system_prompt_prefix_with_budget_and_truncations(
+                include_user,
+                workspace_budget_bytes,
+            );
+            self.emit_workspace_prompt_truncations(ws, truncations);
             if prefix.is_empty() {
                 base_prompt.to_string()
             } else {
@@ -66,6 +69,41 @@ impl AgentRuntime {
         }
     }
 
+    fn emit_workspace_prompt_truncations(
+        &self,
+        workspace: &crate::workspace::AgentWorkspace,
+        truncations: Vec<crate::workspace::WorkspacePromptTruncation>,
+    ) {
+        for truncation in truncations {
+            if !workspace.mark_truncation_warning_reported(truncation.file) {
+                continue;
+            }
+
+            let agent_name = self.agent_name.as_deref().unwrap_or("unnamed agent");
+            let message = format!(
+                "Workspace file {} for agent {agent_name} contains {} bytes and exceeds its {}-byte prompt limit. A partial window is included to preserve conversation history, and whole-file writes are refused until a complete view is available.",
+                truncation.file.filename(),
+                truncation.total_bytes,
+                truncation.injection_limit_bytes,
+            );
+            warn!(
+                agent_id = %self.agent_id.0,
+                agent_name = %agent_name,
+                file = truncation.file.filename(),
+                total_bytes = truncation.total_bytes,
+                injection_limit_bytes = truncation.injection_limit_bytes,
+                "Truncated workspace file in system prompt to preserve conversation history"
+            );
+            if let Some(sender) = &self.event_sender {
+                let _ = sender.send(crate::events::RuntimeEvent::Warning {
+                    code: "WORKSPACE_PROMPT_TRUNCATED".to_string(),
+                    message,
+                    source_agent: None,
+                });
+            }
+        }
+    }
+
     pub(crate) fn fixed_system_prompt_for_budget(
         &self,
         base_prompt: &str,
@@ -73,6 +111,8 @@ impl AgentRuntime {
     ) -> String {
         let mut fixed_prompt = base_prompt.to_string();
         fixed_prompt.push_str("\n\n");
+        // Reserve continuation guidance now so rebuilds can keep the same
+        // workspace allocation when they add it after the first tool batch.
         fixed_prompt.push_str(&self.config.prompts.tool_loop);
         if let Some(peer) = dm_peer {
             fixed_prompt.push_str(&Self::dm_addendum(peer));
@@ -96,7 +136,7 @@ impl AgentRuntime {
             .max_input_tokens
             .saturating_sub(fixed_overhead)
             / 2;
-        headroom_tokens.saturating_mul(3)
+        headroom_tokens.saturating_mul(ESTIMATED_BYTES_PER_TOKEN)
     }
 
     /// Returns true if the given context_id represents a user-facing session

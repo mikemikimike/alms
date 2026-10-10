@@ -37,6 +37,9 @@ pub struct AgentWorkspace {
     /// what the other was shown. What keeps *those* honest is the on-disk
     /// half of the check, which compares against the file itself.
     shown: Arc<DashMap<WorkspaceFile, ShownView>>,
+    /// Truncations already reported for this run, so prompt rebuilds do not
+    /// emit the same operator warning once per tool batch.
+    warned_truncations: Arc<DashMap<WorkspaceFile, ()>>,
 }
 
 /// What the agent has been shown of one workspace file, and whether it was
@@ -57,6 +60,13 @@ pub struct AgentWorkspace {
 struct ShownView {
     content: String,
     whole: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WorkspacePromptTruncation {
+    pub(crate) file: WorkspaceFile,
+    pub(crate) total_bytes: usize,
+    pub(crate) injection_limit_bytes: usize,
 }
 
 /// Whether a replacement must clear the shown-view check before it lands.
@@ -93,10 +103,12 @@ pub enum RefusedWrite {
     /// agent is not holding, which is what this refuses.
     NeverShown,
     /// The agent was shown a window, not the file. Reachable for
-    /// `memories.md` past [`MEMORIES_INJECTION_CAP`], and for any file past
-    /// [`WORKSPACE_READ_CAP`] on the `workspace_read` path. This one needs no
-    /// concurrency and no second writer: it is the steady state of any
-    /// memories file that has grown past the cap.
+    /// `memories.md` past [`MEMORIES_INJECTION_CAP`], an identity file whose
+    /// run-scoped allocation requires a partial window, and any file past
+    /// [`WORKSPACE_READ_CAP`] on the `workspace_read` path. A partial identity
+    /// file larger than the read cap cannot be recovered in one read. The
+    /// memories case needs no concurrency and no second writer: it is the
+    /// steady state of any memories file that has grown past the cap.
     ShownPartially,
     /// The file has changed since the agent was shown it — by another live
     /// instance of the same named agent, by an operator edit, or by this very
@@ -279,16 +291,15 @@ impl WorkspaceFile {
     }
 }
 
-/// Maximum content bytes injected from any one workspace file into the system
-/// prompt. The marker describing a truncated window is additional to this cap.
+/// Legacy name for the fixed `memories.md` prompt window. Identity files are
+/// limited only by the run-scoped workspace budget.
 pub const WORKSPACE_FILE_INJECTION_CAP: usize = 4000;
 
 /// Maximum content bytes injected from `memories.md` into the system prompt.
-/// Retained as the memory-specific name for callers and tests.
 ///
 /// `ContextBuilder` budgets history around the system prompt; it does not trim
-/// the system prompt itself, so this cap is what prevents workspace content
-/// from evicting the conversation.
+/// the system prompt itself, so the run-scoped budget and this cap prevent
+/// workspace content from evicting the conversation.
 pub const MEMORIES_INJECTION_CAP: usize = WORKSPACE_FILE_INJECTION_CAP;
 
 /// The `memories.md` text to inject into the system prompt: the file verbatim
@@ -424,12 +435,49 @@ fn head_window_through_line_end(contents: &str, cap: usize) -> &str {
     }
 }
 
+fn allocate_workspace_content_budget(file_lengths: &[usize], budget_bytes: usize) -> Vec<usize> {
+    let total_content_bytes = file_lengths
+        .iter()
+        .fold(0usize, |total, length| total.saturating_add(*length));
+    let mut remaining = budget_bytes.min(total_content_bytes);
+    let mut allocations = vec![0; file_lengths.len()];
+    let mut active: Vec<_> = file_lengths
+        .iter()
+        .enumerate()
+        .filter_map(|(index, length)| (*length > 0).then_some(index))
+        .collect();
+
+    while remaining > 0 && !active.is_empty() {
+        let share = remaining / active.len();
+        let remainder = remaining % active.len();
+        let mut allocated_this_round = 0;
+        let mut next_active = Vec::with_capacity(active.len());
+        for (position, index) in active.into_iter().enumerate() {
+            let capacity = file_lengths[index].saturating_sub(allocations[index]);
+            let target = share + usize::from(position < remainder);
+            let allocation = capacity.min(target);
+            allocations[index] += allocation;
+            allocated_this_round += allocation;
+            if allocations[index] < file_lengths[index] {
+                next_active.push(index);
+            }
+        }
+        remaining -= allocated_this_round;
+        active = next_active;
+    }
+
+    allocations
+}
+
 /// Maximum bytes of one workspace file returned by the `workspace_read` tool.
 ///
-/// Three times [`WORKSPACE_FILE_INJECTION_CAP`], because this is the *deliberate*
-/// read — the agent asked for the file, usually because it is about to
-/// replace it, and a rewrite composed from a 4000-byte window is the problem
-/// rather than the fix. Two ceilings bound it from above:
+/// Three times the fixed [`MEMORIES_INJECTION_CAP`], because this is the
+/// *deliberate* read — the agent asked for the file, usually because it is
+/// about to replace it, and a rewrite composed from a 4000-byte memories
+/// window is the problem rather than the fix. Identity files are instead
+/// limited by the run-scoped prompt budget: they can be injected whole above
+/// this read cap, but a partial view of a larger identity file cannot be
+/// recovered by one `workspace_read`. Two ceilings bound this read from above:
 ///
 /// - `tool_output_truncate`'s default byte cap is 32 KB
 ///   (`DEFAULT_MAX_BYTES`), applied to the tool result *after* this function
@@ -495,9 +543,9 @@ const WORKSPACE_READ_JSON_ENVELOPE: usize = 1024;
 /// at compile time should fail the build, not a test run.
 const _: () = {
     assert!(
-        WORKSPACE_READ_CAP > WORKSPACE_FILE_INJECTION_CAP,
-        "a deliberate read must return more than the prompt injection already did, \
-         or `workspace_read` cannot be the recovery from a windowed view"
+        WORKSPACE_READ_CAP > MEMORIES_INJECTION_CAP,
+        "a deliberate read must return more than the fixed memories prompt window, \
+         or `workspace_read` cannot recover a normal over-cap memories file"
     );
     assert!(
         WORKSPACE_READ_CAP * WORKSPACE_READ_JSON_ESCAPE_FACTOR + WORKSPACE_READ_JSON_ENVELOPE
@@ -569,6 +617,7 @@ impl AgentWorkspace {
         Self {
             dir: base_dir.into().join(agent_name),
             shown: Arc::new(DashMap::new()),
+            warned_truncations: Arc::new(DashMap::new()),
         }
     }
 
@@ -579,6 +628,7 @@ impl AgentWorkspace {
         Self {
             dir: dir.into(),
             shown: Arc::new(DashMap::new()),
+            warned_truncations: Arc::new(DashMap::new()),
         }
     }
 
@@ -625,15 +675,20 @@ impl AgentWorkspace {
     /// seen" a property of the runtime rather than of its callers' habits.
     pub fn forget_shown_files(&self) {
         self.shown.clear();
+        self.warned_truncations.clear();
+    }
+
+    pub(crate) fn mark_truncation_warning_reported(&self, file: WorkspaceFile) -> bool {
+        self.warned_truncations.insert(file, ()).is_none()
     }
 
     /// Read a workspace file for the agent and record what was handed over.
     ///
     /// This is the `workspace_read` tool's whole implementation, and the
-    /// deliberate counterpart to the system-prompt injection: the injection
-    /// is what the agent gets whether it wanted it or not, capped small
-    /// enough to share the prompt with everything else; this is what it gets
-    /// when it asks, capped at [`WORKSPACE_READ_CAP`].
+    /// deliberate counterpart to the system-prompt injection: the prompt
+    /// builder fits identity files into the run-scoped workspace budget and
+    /// keeps the fixed memories window; this is what the agent gets when it
+    /// asks, capped at [`WORKSPACE_READ_CAP`].
     ///
     /// The recorded base is the **whole file**, not the returned window, so
     /// the comparison in [`Self::write_file_checked`] stays a comparison
@@ -1177,18 +1232,10 @@ impl AgentWorkspace {
         heading: Option<&str>,
         contents: String,
         cap_bytes: usize,
-    ) {
+    ) -> Option<WorkspacePromptTruncation> {
+        let total_bytes = contents.len();
         let (window, shown_whole_here) =
             workspace_file_injection_window(file, &contents, cap_bytes);
-
-        if !shown_whole_here {
-            warn!(
-                file = file.filename(),
-                total_bytes = contents.len(),
-                injection_cap_bytes = cap_bytes,
-                "Truncated workspace file in system prompt"
-            );
-        }
 
         // A complete read may have happened between prompt rebuilds. Preserve
         // that whole-file view when the bytes are unchanged; otherwise a
@@ -1206,6 +1253,16 @@ impl AgentWorkspace {
                 None => window,
             });
         }
+
+        (!shown_whole_here).then_some(WorkspacePromptTruncation {
+            file,
+            total_bytes,
+            injection_limit_bytes: if file == WorkspaceFile::Memories {
+                cap_bytes.min(MEMORIES_INJECTION_CAP)
+            } else {
+                cap_bytes
+            },
+        })
     }
 
     /// Build a system-prompt prefix from workspace files without a runtime
@@ -1236,6 +1293,15 @@ impl AgentWorkspace {
         include_user: bool,
         budget_bytes: usize,
     ) -> String {
+        self.build_system_prompt_prefix_with_budget_and_truncations(include_user, budget_bytes)
+            .0
+    }
+
+    pub(crate) fn build_system_prompt_prefix_with_budget_and_truncations(
+        &self,
+        include_user: bool,
+        budget_bytes: usize,
+    ) -> (String, Vec<WorkspacePromptTruncation>) {
         // Headers and truncation markers are outside the file-content window.
         // The caller supplies one run-scoped budget; ContextBuilder trims
         // history around the resulting system prompt but never trims it.
@@ -1260,21 +1326,37 @@ impl AgentWorkspace {
             .count();
         let content_budget = budget_bytes
             .saturating_sub(populated_files.saturating_mul(MARKER_AND_HEADING_RESERVE_BYTES));
-        let per_file_cap = content_budget
-            .checked_div(populated_files)
-            .unwrap_or(WORKSPACE_FILE_INJECTION_CAP)
-            .min(WORKSPACE_FILE_INJECTION_CAP);
+        let content_limits: Vec<_> = contents
+            .iter()
+            .map(|(file, _, text)| {
+                if *file == WorkspaceFile::Memories {
+                    text.len().min(MEMORIES_INJECTION_CAP)
+                } else {
+                    text.len()
+                }
+            })
+            .collect();
+        let content_allocations =
+            allocate_workspace_content_budget(&content_limits, content_budget);
 
         let mut parts = Vec::new();
-        for (file, heading, file_contents) in contents {
-            self.append_system_prompt_file(&mut parts, file, heading, file_contents, per_file_cap);
+        let mut truncations = Vec::new();
+        for ((file, heading, file_contents), cap_bytes) in
+            contents.into_iter().zip(content_allocations)
+        {
+            if let Some(truncation) =
+                self.append_system_prompt_file(&mut parts, file, heading, file_contents, cap_bytes)
+            {
+                truncations.push(truncation);
+            }
         }
 
-        if parts.is_empty() {
+        let prefix = if parts.is_empty() {
             String::new()
         } else {
             parts.join("\n\n")
-        }
+        };
+        (prefix, truncations)
     }
 
     /// Get the bootstrap system prompt for first-time agent setup
@@ -1467,7 +1549,7 @@ mod tests {
             );
             ws.write_file_as_operator(file, &contents).unwrap();
 
-            let prefix = ws.build_system_prompt_prefix(true);
+            let prefix = ws.build_system_prompt_prefix_with_budget(true, 3000);
             assert!(prefix.contains(&format!("{}-START", file.filename())));
             assert!(prefix.contains(&format!("{}-FILLER", file.filename())));
             assert!(prefix.contains(&format!(
@@ -1488,7 +1570,7 @@ mod tests {
             let read = ws.read_for_agent(file);
             assert!(read.complete, "the file fits the workspace_read cap");
             assert_eq!(read.content, contents);
-            let _ = ws.build_system_prompt_prefix(true);
+            let _ = ws.build_system_prompt_prefix_with_budget(true, 3000);
             assert_eq!(
                 ws.write_file_checked(file, "replacement").unwrap(),
                 CheckedWrite::Written,
@@ -1518,6 +1600,100 @@ mod tests {
         let window = head_window_through_line_end(&one_line, 4001);
         assert!(one_line.is_char_boundary(window.len()));
         assert!(window.len() <= 4001);
+
+        let markdown = format!("# Personality\n\n{}", "x".repeat(8000));
+        let window = head_window_through_line_end(&markdown, 4000);
+        assert_eq!(window.len(), 4000);
+        assert!(window.starts_with("# Personality\n\n"));
+
+        let short_preamble = format!("a\nb\n{}", "x".repeat(8000));
+        let window = head_window_through_line_end(&short_preamble, 4000);
+        assert_eq!(window.len(), 4000);
+        assert!(window.starts_with("a\nb\n"));
+    }
+
+    #[test]
+    fn workspace_content_budget_water_fills_after_small_files_are_satisfied() {
+        assert_eq!(
+            allocate_workspace_content_budget(&[3534, 2, 2, 2], 8000),
+            [3534, 2, 2, 2]
+        );
+        assert_eq!(
+            allocate_workspace_content_budget(&[8000, 8000, 1], 8001),
+            [4000, 4000, 1]
+        );
+        assert_eq!(
+            allocate_workspace_content_budget(&[100, 100, 100, 100], 5),
+            [2, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn memories_truncation_reports_its_fixed_injection_limit() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file_as_operator(WorkspaceFile::Memories, &"m".repeat(5000))
+            .unwrap();
+
+        let (_, truncations) =
+            ws.build_system_prompt_prefix_with_budget_and_truncations(false, 100_000);
+        assert_eq!(truncations.len(), 1);
+        assert_eq!(truncations[0].file, WorkspaceFile::Memories);
+        assert_eq!(truncations[0].injection_limit_bytes, MEMORIES_INJECTION_CAP);
+    }
+
+    #[test]
+    fn identity_files_use_available_budget_and_keep_the_whole_file_authoritative() {
+        let (_dir, ws) = test_workspace();
+        let personality = "p".repeat(13_260);
+        ws.write_file_as_operator(WorkspaceFile::Personality, &personality)
+            .unwrap();
+
+        let prefix = ws.build_system_prompt_prefix(true);
+        assert!(prefix.contains(&personality));
+        assert!(!prefix.contains("personality.md truncated:"));
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Personality, "replacement")
+                .unwrap(),
+            CheckedWrite::Written,
+            "a complete injected view should allow the normal whole-file replacement"
+        );
+    }
+
+    #[test]
+    fn identity_files_are_windowed_when_the_run_budget_requires_it() {
+        let (_dir, ws) = test_workspace();
+        let personality = "p".repeat(13_260);
+        ws.write_file_as_operator(WorkspaceFile::Personality, &personality)
+            .unwrap();
+
+        let (prefix, truncations) =
+            ws.build_system_prompt_prefix_with_budget_and_truncations(true, 1000);
+        assert!(prefix.contains("personality.md truncated:"));
+        assert_eq!(truncations.len(), 1);
+        assert_eq!(truncations[0].file, WorkspaceFile::Personality);
+        assert_eq!(truncations[0].total_bytes, personality.len());
+        assert_eq!(truncations[0].injection_limit_bytes, 744);
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Personality, "replacement")
+                .unwrap(),
+            CheckedWrite::Refused(RefusedWrite::ShownPartially)
+        );
+    }
+
+    #[test]
+    fn budgeted_identity_window_keeps_utf8_boundaries_end_to_end() {
+        let (_dir, ws) = test_workspace();
+        let personality = "🙂".repeat(500);
+        ws.write_file_as_operator(WorkspaceFile::Personality, &personality)
+            .unwrap();
+
+        let prefix = ws.build_system_prompt_prefix_with_budget(true, 900);
+        let (shown, _) = prefix
+            .split_once("\n\n[personality.md truncated:")
+            .expect("a constrained identity file carries a truncation marker");
+        assert!(personality.starts_with(shown));
+        assert!(personality.is_char_boundary(shown.len()));
+        assert!(shown.len() <= 644);
     }
 
     // — memories injection window (#1308) ----------------------------------
@@ -2967,6 +3143,25 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[test]
+    fn a_capped_read_cannot_recover_a_budget_truncated_identity_file() {
+        let (_dir, ws) = test_workspace();
+        let personality = "p".repeat(WORKSPACE_READ_CAP + 1);
+        ws.write_file_as_operator(WorkspaceFile::Personality, &personality)
+            .unwrap();
+        let _ = ws.build_system_prompt_prefix_with_budget(false, 1000);
+
+        let read = ws.read_for_agent(WorkspaceFile::Personality);
+        assert!(!read.complete);
+        assert_eq!(read.total_bytes, personality.len());
+        assert_eq!(read.content.len(), WORKSPACE_READ_CAP);
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Personality, &read.content)
+                .unwrap(),
+            CheckedWrite::Refused(RefusedWrite::ShownPartially)
+        );
     }
 
     /// A read of a file that is not there is a complete read of nothing.

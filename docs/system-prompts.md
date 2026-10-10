@@ -133,15 +133,17 @@ appended after it:
    `build_system_prompt_prefix_with_budget()` reads workspace files and appends them after
    the base prompt: `{base_prompt}\n\n{workspace_prefix}`. The workspace files
    are concatenated in this internal order:
-    - `personality.md` (head-windowed at 4000 bytes when oversized)
-    - `goals.md` (prefixed with `## Current Goals`, head-windowed at 4000 bytes when oversized)
-    - `user.md` (prefixed with `## About the User`, head-windowed at 4000 bytes when oversized) — **conditional**: skipped for non-user-facing sessions (DM, subagent, job, notification, and episodic contexts) to save tokens
+    - `personality.md` (head-windowed only when the run budget requires it)
+    - `goals.md` (prefixed with `## Current Goals`, head-windowed only when the run budget requires it)
+    - `user.md` (prefixed with `## About the User`, head-windowed only when the run budget requires it) — **conditional**: skipped for non-user-facing sessions (DM, subagent, job, notification, and episodic contexts) to save tokens
     - `memories.md` (prefixed with `## Memories`, tail-windowed at 4000 bytes — past the cap the agent is shown the *most recent* bytes behind a leading truncation marker, not the oldest; see `agent-runtime-design.md` § "Size management")
 
    The runtime shares one workspace budget across these files for the duration of a run.
-   The budget is computed from `max_input_tokens` and leaves room for history; rebuilding
-   after a tool batch reuses it, so the system block stays byte-stable while files are
-   unchanged.
+   It water-fills the available bytes across populated files, so short files use only
+   what they need and identity files stay whole unless history headroom requires a window.
+   `memories.md` retains its fixed 4000-byte cap. A partial file carries a marker and
+   emits one `run_warning` per file per run. Rebuilds reuse the original budget, so
+   unchanged files do not shrink as tool results accumulate.
 
 3. **Tool loop addendum** (after first tool round): On subsequent LLM calls in the
    same agent loop, the system message is rebuilt as:

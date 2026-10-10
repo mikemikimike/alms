@@ -961,6 +961,14 @@ mod tests {
         assert!(!message.contains("end of the file"), "{message}");
     }
 
+    #[test]
+    fn workspace_read_description_is_anchor_neutral() {
+        let (_dir, _write, read) = test_tools();
+        let description = read.description();
+        assert!(description.contains("partial window onto a long file"));
+        assert!(!description.contains("end of a long file"));
+    }
+
     /// The recovery, through both tools, in the order an agent would use
     /// them: refused, read, replaced.
     ///

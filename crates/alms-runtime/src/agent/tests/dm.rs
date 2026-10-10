@@ -450,11 +450,13 @@ async fn test_dm_addendum_survives_tool_loop_rebuild() {
     let _session = session_manager.get_or_create_shared(session_id, dm_context);
 
     // Step 1: Build initial context and verify addendum is present.
-    let context = runtime
-        .build_context(&session_manager, &session_id, dm_context, "Hello")
+    let built = runtime
+        .build_context_with_budget(&session_manager, &session_id, dm_context, "Hello")
         .await
         .unwrap();
-    let initial_system = context[0].content.as_deref().unwrap_or("");
+    let workspace_budget_bytes = built.workspace_budget_bytes;
+    let mut messages = built.messages;
+    let initial_system = messages[0].content.as_deref().unwrap_or("");
     assert!(
         initial_system.contains("send_message"),
         "Initial system prompt should contain DM addendum"
@@ -462,16 +464,15 @@ async fn test_dm_addendum_survives_tool_loop_rebuild() {
 
     // Step 2: Simulate the tool-loop rebuild (mirrors agent_loop lines 1234-1244).
     // This is the exact code path that was broken before #346.
-    let dm_peer: Option<&str> = runtime.dm_peer_name(dm_context).as_deref().map(|s| {
-        // Leak the string so we get a &'static str -- acceptable in tests.
-        Box::leak(s.to_string().into_boxed_str()) as &str
-    });
+    let dm_peer = runtime.dm_peer_name(dm_context);
     let include_user = AgentRuntime::is_user_facing_context(dm_context);
 
-    // Use the extracted helper (rebuild_system_prompt_for_tool_loop) —
-    // mirrors the exact code path in agent_loop.
-    let mut messages = vec![LlmMessage::system(initial_system.to_string())];
-    runtime.rebuild_system_prompt_for_tool_loop(&mut messages, include_user, dm_peer);
+    runtime.rebuild_system_prompt_for_tool_loop_with_budget(
+        &mut messages,
+        include_user,
+        dm_peer.as_deref(),
+        workspace_budget_bytes,
+    );
     let tool_loop_prompt = messages[0].content.as_deref().unwrap_or("");
 
     // The rebuilt system prompt must still contain the DM addendum.

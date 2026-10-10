@@ -289,6 +289,130 @@ async fn tool_loop_rebuild_reuses_the_initial_workspace_budget() {
 }
 
 #[tokio::test]
+async fn normal_workspace_files_are_byte_stable_across_build_and_rebuild() {
+    use crate::workspace::{AgentWorkspace, WorkspaceFile};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace = AgentWorkspace::new(dir.path(), "alice");
+    let personality = "p".repeat(1684);
+    let goals = "g".repeat(39);
+    let memories = "m".repeat(963);
+    workspace
+        .write_file_as_operator(WorkspaceFile::Personality, &personality)
+        .unwrap();
+    workspace
+        .write_file_as_operator(WorkspaceFile::Goals, &goals)
+        .unwrap();
+    workspace
+        .write_file_as_operator(WorkspaceFile::Memories, &memories)
+        .unwrap();
+
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        },
+        LlmClient::new(LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap()
+    .with_workspace(workspace);
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let session = session_manager.get_or_create(runtime.agent_id, "web-chat");
+    let built = runtime
+        .build_context_with_budget(&session_manager, &session.id, "web-chat", "continue")
+        .await
+        .unwrap();
+    let expected_initial = format!(
+        "{}\n\n{}\n\n## Current Goals\n{}\n\n## Memories\n{}",
+        runtime.config.system_prompt, personality, goals, memories
+    );
+    assert_eq!(built.messages[0].content_str(), expected_initial);
+
+    let mut messages = built.messages;
+    for batch in 1..=2 {
+        messages.push(LlmMessage::assistant(format!("tool batch {batch}")));
+        messages.push(LlmMessage::tool_result(format!("call_{batch}"), "ok"));
+        runtime.rebuild_system_prompt_for_tool_loop_with_budget(
+            &mut messages,
+            true,
+            None,
+            built.workspace_budget_bytes,
+        );
+        assert_eq!(
+            messages[0].content_str(),
+            format!("{expected_initial}\n\n{}", runtime.config.prompts.tool_loop),
+            "unchanged normal-size files should retain the same bytes on every rebuild"
+        );
+    }
+}
+
+#[test]
+fn workspace_truncation_warning_is_reported_once_per_run() {
+    use crate::workspace::{AgentWorkspace, WorkspaceFile};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace = AgentWorkspace::new(dir.path(), "alice");
+    workspace
+        .write_file_as_operator(WorkspaceFile::Personality, &"p".repeat(5000))
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let runtime = AgentRuntime {
+        event_sender: Some(tx),
+        agent_name: Some("alice".to_string()),
+        ..AgentRuntime::new(
+            AgentId::new(),
+            AgentConfig {
+                system_prompt: "base".into(),
+                sandbox_root: "".into(),
+                ..AgentConfig::default()
+            },
+            LlmClient::new(LlmConfig {
+                mock: true,
+                ..LlmConfig::default()
+            })
+            .unwrap(),
+        )
+        .unwrap()
+        .with_workspace(workspace)
+    };
+
+    for _ in 0..3 {
+        let prompt = runtime.assemble_system_prompt_with_budget("base", true, 1000);
+        assert!(prompt.contains("personality.md truncated:"));
+    }
+
+    let RuntimeEvent::Warning {
+        code,
+        message,
+        source_agent,
+    } = rx
+        .try_recv()
+        .expect("the first partial view emits a warning")
+    else {
+        panic!("expected a workspace warning event");
+    };
+    assert_eq!(code, "WORKSPACE_PROMPT_TRUNCATED");
+    assert!(message.contains("alice"));
+    assert!(message.contains("personality.md"));
+    assert!(source_agent.is_none());
+    assert!(rx.try_recv().is_err(), "rebuilds do not repeat the warning");
+
+    runtime.workspace.as_ref().unwrap().forget_shown_files();
+    let _ = runtime.assemble_system_prompt_with_budget("base", true, 1000);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(RuntimeEvent::Warning { code, .. }) if code == "WORKSPACE_PROMPT_TRUNCATED"
+    ));
+}
+
+#[tokio::test]
 async fn test_build_context_dm_perspective_mapping() {
     let runtime = AgentRuntime {
         agent_name: Some("bob".to_string()),
