@@ -424,6 +424,10 @@ fn test_dm_addendum_substitutes_different_peers() {
 /// 1234-1244) and verify the rebuilt system prompt contains the addendum.
 #[tokio::test]
 async fn test_dm_addendum_survives_tool_loop_rebuild() {
+    use crate::workspace::{AgentWorkspace, WorkspaceFile};
+    use alms_core::config::ContextConfig;
+    use tempfile::tempdir;
+
     let config = LlmConfig {
         mock: true,
         ..LlmConfig::default()
@@ -432,8 +436,22 @@ async fn test_dm_addendum_survives_tool_loop_rebuild() {
     let session_manager = SessionManager::new(session_config);
     let llm = LlmClient::new(config).unwrap();
     let bob_id = AgentId::new();
+    let workspace_dir = tempdir().unwrap();
+    let workspace = AgentWorkspace::new(workspace_dir.path(), "bob");
+    workspace
+        .write_file_as_operator(
+            WorkspaceFile::Personality,
+            &format!("DM_WORKSPACE_START\n{}\nDM_WORKSPACE_END", "p".repeat(5000)),
+        )
+        .unwrap();
 
     let agent_config = AgentConfig {
+        system_prompt: "DM base prompt.".to_string(),
+        context_config: ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 4_000,
+            ..ContextConfig::default()
+        },
         sandbox_root: "".into(),
         ..AgentConfig::default()
     };
@@ -442,6 +460,7 @@ async fn test_dm_addendum_survives_tool_loop_rebuild() {
     let runtime = AgentRuntime::new(bob_id, agent_config, llm)
         .unwrap()
         .with_agent_name("bob".to_string())
+        .with_workspace(workspace)
         .with_dm_implicit_reply();
 
     // Set up a DM session.
@@ -457,6 +476,8 @@ async fn test_dm_addendum_survives_tool_loop_rebuild() {
     let workspace_budget_bytes = built.workspace_budget_bytes;
     let mut messages = built.messages;
     let initial_system = messages[0].content.as_deref().unwrap_or("");
+    assert!(initial_system.contains("DM_WORKSPACE_START"));
+    assert!(initial_system.contains("personality.md truncated"));
     assert!(
         initial_system.contains("send_message"),
         "Initial system prompt should contain DM addendum"
@@ -475,6 +496,8 @@ async fn test_dm_addendum_survives_tool_loop_rebuild() {
     );
     let tool_loop_prompt = messages[0].content.as_deref().unwrap_or("");
 
+    assert!(tool_loop_prompt.contains("DM_WORKSPACE_START"));
+    assert!(tool_loop_prompt.contains("personality.md truncated"));
     // The rebuilt system prompt must still contain the DM addendum.
     assert!(
         tool_loop_prompt.contains("send_message"),
